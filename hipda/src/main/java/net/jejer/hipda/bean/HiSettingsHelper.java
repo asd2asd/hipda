@@ -589,7 +589,7 @@ public class HiSettingsHelper {
     }
 
     private String getThemeFromPref() {
-        mTheme = mSharedPref.getString(PERF_THEME_MODE, THEME_MODE_LIGHT);
+        mTheme = mSharedPref.getString(PERF_THEME_MODE, THEME_MODE_AUTO);
         return mTheme;
     }
 

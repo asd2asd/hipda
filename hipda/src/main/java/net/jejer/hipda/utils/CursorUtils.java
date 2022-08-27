@@ -1,15 +1,9 @@
 package net.jejer.hipda.utils;
 
-import android.annotation.TargetApi;
-import android.content.Context;
-import android.database.Cursor;
 import android.graphics.BitmapFactory;
-import android.media.ExifInterface;
-import android.net.Uri;
-import android.os.Build;
-import android.provider.DocumentsContract;
-import android.provider.MediaStore;
 import android.text.TextUtils;
+
+import androidx.exifinterface.media.ExifInterface;
 
 import java.io.File;
 
@@ -19,34 +13,22 @@ import java.io.File;
  */
 public class CursorUtils {
 
-    public static ImageFileInfo getImageFileInfo(Context context, Uri uri) {
-        ImageFileInfo result;
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.KITKAT || uri.toString().startsWith("content://media")) {
-            result = getImageInfo_API11to18(context, uri);
-            if (result == null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
-                result = getImageInfo_API19(context, uri);
-            }
-        } else {
-            result = getImageInfo_API19(context, uri);
-            if (result == null) {
-                result = getImageInfo_API11to18(context, uri);
-            }
-        }
-        if (result == null || TextUtils.isEmpty(result.getFilePath()))
-            return new ImageFileInfo();
-
-        File imageFile = new File(result.getFilePath());
+    public static ImageFileInfo getImageFileInfo(File imageFile) {
         if (!imageFile.exists())
-            return new ImageFileInfo();
+            return null;
 
+        ImageFileInfo result = new ImageFileInfo();
+        result.setFilePath(imageFile.getAbsolutePath());
         BitmapFactory.Options options = new BitmapFactory.Options();
         options.inJustDecodeBounds = true;
 
-        //Returns null, sizes are in the options variable
-        BitmapFactory.decodeFile(result.getFilePath(), options);
+        BitmapFactory.decodeFile(imageFile.getAbsolutePath(), options);
         int width = options.outWidth;
         int height = options.outHeight;
         String mime = Utils.nullToText(options.outMimeType);
+
+        if (TextUtils.isEmpty(mime) || width <= 0 || height <= 0)
+            return null;
 
         result.setMime(mime);
         result.setFileSize(imageFile.length());
@@ -79,66 +61,6 @@ public class CursorUtils {
             Logger.e(e);
         }
         return orientation;
-    }
-
-    @TargetApi(Build.VERSION_CODES.KITKAT)
-    private static ImageFileInfo getImageInfo_API19(Context context, Uri uri) {
-        ImageFileInfo result = new ImageFileInfo();
-        String[] column = {MediaStore.Images.Media.DATA, MediaStore.Images.ImageColumns.ORIENTATION};
-
-        Cursor cursor = null;
-        try {
-            String wholeID = DocumentsContract.getDocumentId(uri);
-            String id = wholeID.split(":")[1];
-            String sel = MediaStore.Images.Media._ID + "=?";
-
-            cursor = context.getContentResolver().query(MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                    column, sel, new String[]{id}, null);
-            int pathIndex = cursor.getColumnIndex(column[0]);
-            int orientationIndex = cursor.getColumnIndex(column[1]);
-
-            if (cursor.moveToFirst()) {
-                if (pathIndex >= 0)
-                    result.setFilePath(cursor.getString(pathIndex));
-                if (orientationIndex >= 0)
-                    result.setOrientation(cursor.getInt(orientationIndex));
-            }
-        } catch (Exception e) {
-            Logger.e(e);
-            return null;
-        } finally {
-            if (cursor != null)
-                cursor.close();
-        }
-        return result;
-    }
-
-
-    private static ImageFileInfo getImageInfo_API11to18(Context context, Uri contentUri) {
-        ImageFileInfo result = new ImageFileInfo();
-        String[] column = {MediaStore.Images.Media.DATA, MediaStore.Images.ImageColumns.ORIENTATION};
-
-        Cursor cursor = null;
-        try {
-            cursor = context.getContentResolver().query(contentUri, null, null, null, null);
-
-            int pathIndex = cursor.getColumnIndexOrThrow(column[0]);
-            int orientationIndex = cursor.getColumnIndexOrThrow(column[1]);
-
-            if (cursor.moveToFirst()) {
-                if (pathIndex >= 0)
-                    result.setFilePath(cursor.getString(pathIndex));
-                if (orientationIndex >= 0)
-                    result.setOrientation(cursor.getInt(orientationIndex));
-            }
-        } catch (Exception e) {
-            Logger.e(e);
-            return null;
-        } finally {
-            if (cursor != null)
-                cursor.close();
-        }
-        return result;
     }
 
 }

@@ -1,25 +1,23 @@
 package net.jejer.hipda.async;
 
-import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.Bitmap.CompressFormat;
 import android.graphics.BitmapFactory;
-import android.graphics.Matrix;
 import android.media.ThumbnailUtils;
 import android.net.Uri;
-import android.provider.MediaStore;
 import android.text.TextUtils;
 
 import net.jejer.hipda.bean.HiSettingsHelper;
 import net.jejer.hipda.okhttp.OkHttpHelper;
+import net.jejer.hipda.ui.HiApplication;
 import net.jejer.hipda.utils.CursorUtils;
 import net.jejer.hipda.utils.HiUtils;
 import net.jejer.hipda.utils.ImageFileInfo;
 import net.jejer.hipda.utils.Logger;
 import net.jejer.hipda.utils.Utils;
 
-import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.text.SimpleDateFormat;
@@ -28,6 +26,7 @@ import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
 
+import id.zelory.compressor.Compressor;
 import okhttp3.MediaType;
 import okhttp3.MultipartBody;
 import okhttp3.Request;
@@ -36,17 +35,16 @@ import okhttp3.Response;
 
 public class UploadImgHelper {
 
-    private final static int MAX_QUALITY = 90;
+    private final static int MAX_QUALITY = 80;
+    private final static int MAX_DIMENSION = 2560;
     private static final int THUMB_SIZE = 256;
 
-    private int mMaxImageFileSize = 800 * 1024;
-    private int mMaxPixels = 2560 * 2560;
+    private int mMaxUploadSize = 2048 * 1024;
 
     private UploadImgListener mListener;
 
     private String mUid;
     private String mHash;
-    private Context mCtx;
     private Uri[] mUris;
     private boolean mOriginal;
 
@@ -55,10 +53,11 @@ public class UploadImgHelper {
     private Bitmap mThumb;
     private int mTotal;
     private int mCurrent;
-    private String mCurrentFileName = "";
 
-    public UploadImgHelper(Context ctx, UploadImgListener v, String uid, String hash, Uri[] uris, boolean original) {
-        mCtx = ctx;
+    private File mTempFile;
+    private File mCompressedFile;
+
+    public UploadImgHelper(UploadImgListener v, String uid, String hash, Uri[] uris, boolean original) {
         mListener = v;
         mUid = uid;
         mHash = hash;
@@ -66,23 +65,22 @@ public class UploadImgHelper {
         mOriginal = original;
 
         int maxUploadSize = HiSettingsHelper.getInstance().getMaxUploadFileSize();
-        if (maxUploadSize > 0 && mMaxImageFileSize > maxUploadSize) {
-            mMaxPixels = (int) (0.6 * mMaxPixels);
-            mMaxImageFileSize = maxUploadSize;
+        if (maxUploadSize > 0) {
+            mMaxUploadSize = maxUploadSize;
         }
     }
 
     public interface UploadImgListener {
         void updateProgress(int total, int current, int percentage);
 
-        void itemComplete(Uri uri, int total, int current, String currentFileName, String message, String detail, String imgId, Bitmap thumbtail);
+        void itemComplete(Uri uri, int total, int current, String message, String detail, String imgId, Bitmap thumbtail);
     }
 
     public void upload() {
-        Map<String, String> post_param = new HashMap<>();
+        Map<String, String> postParam = new HashMap<>();
 
-        post_param.put("uid", mUid);
-        post_param.put("hash", mHash);
+        postParam.put("uid", mUid);
+        postParam.put("hash", mHash);
 
         mTotal = mUris.length;
 
@@ -90,200 +88,183 @@ public class UploadImgHelper {
         for (Uri uri : mUris) {
             mCurrent = i++;
             mListener.updateProgress(mTotal, mCurrent, -1);
-            String imgId = uploadImage(HiUtils.UploadImgUrl, post_param, uri);
-            mListener.itemComplete(uri, mTotal, mCurrent, mCurrentFileName, mMessage, mDetail, imgId, mThumb);
+            String imgId = uploadImage(postParam, uri);
+            mListener.itemComplete(uri, mTotal, mCurrent, mMessage, mDetail, imgId, mThumb);
         }
     }
 
-    private String uploadImage(String urlStr, Map<String, String> param, Uri uri) {
+    private static String getRandonTempFilename(Uri uri) {
+        try {
+            return Utils.md5(uri.toString() + System.currentTimeMillis());
+        } catch (Exception e) {
+            return System.currentTimeMillis() + "";
+        }
+    }
+
+    private String uploadImage(Map<String, String> param, Uri uri) {
         mThumb = null;
         mMessage = "";
-        mCurrentFileName = "";
-
-        ImageFileInfo imageFileInfo = CursorUtils.getImageFileInfo(mCtx, uri);
-        mCurrentFileName = imageFileInfo.getFileName();
-
-        ByteArrayOutputStream baos = getImageStream(uri, imageFileInfo);
-        if (baos == null) {
-            mMessage = "处理图片发生错误";
+        mTempFile = new File(Utils.getUploadDir() + File.separator + getRandonTempFilename(uri));
+        try {
+            Utils.copy(uri, mTempFile);
+        } catch (Exception e) {
+            mMessage = "无法读取选择的图片文件";
+            mDetail = "\n" + uri.toString()
+                    + "\n" + Utils.getStackTrace(e);
+            Logger.e(e);
             return null;
         }
 
-        MultipartBody.Builder builder = new MultipartBody.Builder()
-                .setType(MultipartBody.FORM);
-        for (String key : param.keySet()) {
-            builder.addFormDataPart(key, param.get(key));
+        ImageFileInfo imageFileInfo = CursorUtils.getImageFileInfo(mTempFile);
+        if (imageFileInfo == null) {
+            mMessage = "无法解析图片信息";
+            mDetail = "\n" + uri.toString();
+            return null;
         }
-        SimpleDateFormat formatter = new SimpleDateFormat("yyMMdd_HHmm", Locale.US);
-        String fileName = "Hi_" + formatter.format(new Date()) + "." + Utils.getImageFileSuffix(imageFileInfo.getMime());
-        RequestBody requestBody = RequestBody.create(MediaType.parse(imageFileInfo.getMime()), baos.toByteArray());
-        builder.addFormDataPart("Filedata", fileName, requestBody);
 
-        Request request = new Request.Builder()
-                .url(urlStr)
-                .post(builder.build())
-                .build();
+        if (imageFileInfo.isGif()
+                && imageFileInfo.getFileSize() > mMaxUploadSize) {
+            mMessage = "GIF图片大小不能超过" + Utils.toSizeText(mMaxUploadSize);
+            return null;
+        }
+
+        ByteArrayOutputStream baos;
+        try {
+            Bitmap bitmap;
+            if (isDirectUploadable(imageFileInfo)) {
+                baos = readFileToStream(imageFileInfo.getFilePath());
+                bitmap = BitmapFactory.decodeFile(imageFileInfo.getFilePath());
+            } else {
+                mCompressedFile = compressImageFile(imageFileInfo);
+                if (mCompressedFile == null) {
+                    mMessage = "无法压缩图片至指定大小 " + Utils.toSizeText(mMaxUploadSize);
+                    mDetail = "\n" + uri.toString()
+                            + "\n文件类型 : " + imageFileInfo.getMime()
+                            + "\n原始大小 : " + Utils.toSizeText(imageFileInfo.getFileSize());
+                    return null;
+                }
+                baos = readFileToStream(mCompressedFile.getAbsolutePath());
+                bitmap = BitmapFactory.decodeFile(mCompressedFile.getAbsolutePath());
+            }
+            mThumb = ThumbnailUtils.extractThumbnail(bitmap, THUMB_SIZE, THUMB_SIZE);
+            bitmap.recycle();
+        } catch (Exception e) {
+            mMessage = "处理图片发生错误";
+            mDetail = "\n" + uri.toString()
+                    + "\n" + Utils.getStackTrace(e);
+            return null;
+        }
+
+        if (baos == null) {
+            if (TextUtils.isEmpty(mMessage)) {
+                mMessage = "处理图片发生错误2";
+                mDetail = "\n" + uri.toString();
+            }
+            return null;
+        }
 
         String imgId = null;
         try {
-            Response response = OkHttpHelper.getInstance().getClient().newCall(request).execute();
-            if (!response.isSuccessful())
-                throw new IOException(OkHttpHelper.ERROR_CODE_PREFIX + response.networkResponse().code());
-
-            String responseText = response.body().string();
-            // DISCUZUPLOAD|0|1721652|1
-            if (responseText.contains("DISCUZUPLOAD")) {
-                String[] s = responseText.split("\\|");
-                if (s.length < 3 || s[2].equals("0")) {
-                    mMessage = "无效上传图片ID";
-                    mDetail = "原图限制：" + Utils.toSizeText(HiSettingsHelper.getInstance().getMaxUploadFileSize())
-                            + "\n压缩目标：" + Utils.toSizeText(mMaxImageFileSize)
-                            + "\n实际大小：" + Utils.toSizeText(baos.size())
-                            + "\n" + responseText;
-                } else {
-                    imgId = s[2];
-                }
-            } else {
-                mMessage = "无法获取图片ID";
-                mDetail = "原图限制：" + Utils.toSizeText(HiSettingsHelper.getInstance().getMaxUploadFileSize())
-                        + "\n压缩目标：" + Utils.toSizeText(mMaxImageFileSize)
-                        + "\n实际大小：" + Utils.toSizeText(baos.size())
-                        + "\n" + responseText;
-            }
+            imgId = postImage(param, imageFileInfo, baos);
         } catch (Exception e) {
             Logger.e(e);
             mMessage = OkHttpHelper.getErrorMessage(e).getMessage();
-            mDetail = "原图限制：" + Utils.toSizeText(HiSettingsHelper.getInstance().getMaxUploadFileSize())
-                    + "\n压缩目标：" + Utils.toSizeText(mMaxImageFileSize)
+            mDetail = "原图限制：" + Utils.toSizeText(mMaxUploadSize)
                     + "\n实际大小：" + Utils.toSizeText(baos.size())
                     + "\n" + e.getMessage();
         } finally {
             try {
                 baos.close();
+                if (mTempFile != null && mTempFile.exists())
+                    mTempFile.delete();
+                if (mCompressedFile != null && mCompressedFile.exists())
+                    mCompressedFile.delete();
             } catch (IOException ignored) {
             }
         }
         return imgId;
     }
 
-    private ByteArrayOutputStream getImageStream(Uri uri, ImageFileInfo imageFileInfo) {
-        if (imageFileInfo.isGif()
-                && imageFileInfo.getFileSize() > HiSettingsHelper.getInstance().getMaxUploadFileSize()) {
-            mMessage = "GIF图片大小不能超过" + Utils.toSizeText(HiSettingsHelper.getInstance().getMaxUploadFileSize());
-            return null;
+    private String postImage(Map<String, String> param, ImageFileInfo imageFileInfo, ByteArrayOutputStream baos) throws IOException {
+        String imgId = null;
+        MultipartBody.Builder builder = new MultipartBody.Builder()
+                .setType(MultipartBody.FORM);
+        for (String key : param.keySet()) {
+            builder.addFormDataPart(key, param.get(key));
         }
+        SimpleDateFormat formatter = new SimpleDateFormat("yyMMdd_HHmmss", Locale.US);
+        String fileName = "Hi" + (mCompressedFile != null ? "_" : "-") + formatter.format(new Date()) + "." + Utils.getImageFileSuffix(imageFileInfo.getMime());
+        RequestBody requestBody = RequestBody.create(MediaType.parse(imageFileInfo.getMime()), baos.toByteArray());
+        builder.addFormDataPart("Filedata", fileName, requestBody);
 
-        Bitmap bitmap;
-        try {
-            bitmap = MediaStore.Images.Media.getBitmap(mCtx.getContentResolver(), uri);
-        } catch (Exception e) {
-            mMessage = "无法获取图片 : " + e.getMessage();
-            return null;
-        }
+        Request request = new Request.Builder()
+                .url(HiUtils.UploadImgUrl)
+                .post(builder.build())
+                .build();
 
-        //gif or very long/wide image or small image or filePath is null
-        if (isDirectUploadable(imageFileInfo)) {
-            mThumb = ThumbnailUtils.extractThumbnail(bitmap, THUMB_SIZE, THUMB_SIZE);
-            bitmap.recycle();
-            return readFileToStream(imageFileInfo.getFilePath());
-        }
+        Response response = OkHttpHelper.getInstance().getClient().newCall(request).execute();
+        if (!response.isSuccessful())
+            throw new IOException(OkHttpHelper.ERROR_CODE_PREFIX + response.networkResponse().code());
 
-        ByteArrayOutputStream baos = new ByteArrayOutputStream();
-        bitmap.compress(CompressFormat.JPEG, MAX_QUALITY, baos);
-        bitmap.recycle();
-        bitmap = null;
-
-        ByteArrayInputStream isBm = new ByteArrayInputStream(baos.toByteArray());
-        BitmapFactory.Options opts = new BitmapFactory.Options();
-        opts.inJustDecodeBounds = true;
-        BitmapFactory.decodeStream(isBm, null, opts);
-
-        int width = opts.outWidth;
-        int height = opts.outHeight;
-
-        //inSampleSize is needed to avoid OOM
-        int be = width * height / mMaxPixels;
-        if (be <= 0)
-            be = 1; //be=1表示不缩放
-        BitmapFactory.Options newOpts = new BitmapFactory.Options();
-        newOpts.inJustDecodeBounds = false;
-        newOpts.inSampleSize = be;
-
-        isBm = new ByteArrayInputStream(baos.toByteArray());
-        Bitmap newbitmap = BitmapFactory.decodeStream(isBm, null, newOpts);
-
-        width = newbitmap.getWidth();
-        height = newbitmap.getHeight();
-
-        //scale bitmap so later compress could run less times, once is the best result
-        //rotate if needed
-        if (width * height > mMaxPixels
-                || imageFileInfo.getOrientation() > 0) {
-
-            float scale = 1.0f;
-            if (width * height > mMaxPixels) {
-                scale = (float) Math.sqrt(mMaxPixels * 1.0 / (width * height));
+        String responseText = response.body().string();
+        // DISCUZUPLOAD|0|1721652|1
+        if (responseText.contains("DISCUZUPLOAD")) {
+            String[] s = responseText.split("\\|");
+            if (s.length < 3 || s[2].equals("0")) {
+                mMessage = "无效上传图片ID";
+                mDetail = "原图限制：" + Utils.toSizeText(mMaxUploadSize)
+                        + "\n实际大小：" + Utils.toSizeText(baos.size())
+                        + "\n" + responseText;
+            } else {
+                imgId = s[2];
             }
-
-            Matrix matrix = new Matrix();
-            if (imageFileInfo.getOrientation() > 0)
-                matrix.postRotate(imageFileInfo.getOrientation());
-            if (scale < 1)
-                matrix.postScale(scale, scale);
-
-            Bitmap scaledBitmap = Bitmap.createBitmap(newbitmap, 0, 0, newbitmap.getWidth(),
-                    newbitmap.getHeight(), matrix, true);
-
-            newbitmap.recycle();
-            newbitmap = scaledBitmap;
+        } else {
+            mMessage = "无法获取图片ID";
+            mDetail = "原图限制：" + Utils.toSizeText(mMaxUploadSize)
+                    + "\n实际大小：" + Utils.toSizeText(baos.size())
+                    + "\n" + responseText;
         }
+        return imgId;
+    }
 
-        int quality = MAX_QUALITY;
-        baos.reset();
-        newbitmap.compress(CompressFormat.JPEG, quality, baos);
-        while (baos.size() > mMaxImageFileSize) {
-            quality -= 10;
-            if (quality <= 50) {
-                mMessage = "无法压缩图片至指定大小 " + Utils.toSizeText(mMaxImageFileSize);
-                return null;
+    private File compressImageFile(ImageFileInfo imageFileInfo) throws Exception {
+        int maxDimension = Math.max(imageFileInfo.getWidth(), imageFileInfo.getHeight());
+        maxDimension = Math.min(maxDimension, MAX_DIMENSION);
+        String compressedFilename = getRandonTempFilename(Uri.fromFile(mTempFile));
+        for (int i = 0; i < 5; i++) {
+            int dimension = (int) (maxDimension * (5 - i) * 0.1);
+            File compressedFile = new Compressor(HiApplication.getAppContext())
+                    .setMaxWidth(dimension)
+                    .setMaxHeight(dimension)
+                    .setQuality(MAX_QUALITY)
+                    .setCompressFormat(CompressFormat.JPEG)
+                    .setDestinationDirectoryPath(Utils.getUploadDir().getAbsolutePath())
+                    .compressToFile(mTempFile, compressedFilename);
+            if (compressedFile.length() <= mMaxUploadSize) {
+                return compressedFile;
             }
-            baos.reset();
-            newbitmap.compress(CompressFormat.JPEG, quality, baos);
         }
-
-        mThumb = ThumbnailUtils.extractThumbnail(newbitmap, THUMB_SIZE, THUMB_SIZE);
-        newbitmap.recycle();
-        newbitmap = null;
-
-        return baos;
+        return null;
     }
 
     private boolean isDirectUploadable(ImageFileInfo imageFileInfo) {
-        if (mOriginal)
-            return true;
-
-        long fileSize = imageFileInfo.getFileSize();
         int w = imageFileInfo.getWidth();
         int h = imageFileInfo.getHeight();
 
-        if (TextUtils.isEmpty(imageFileInfo.getFilePath()))
-            return false;
+        //原图/gif/超长图
+        return (mOriginal || imageFileInfo.isGif() || (Math.max(w, h) * 1.0 / Math.min(w, h) >= 3))
+                && imageFileInfo.getOrientation() <= 0
+                && isMimeSupported(imageFileInfo.getMime())
+                && imageFileInfo.getFileSize() <= mMaxUploadSize;
+    }
 
-        if (imageFileInfo.getOrientation() > 0)
-            return false;
-
-        //gif image
-        if (imageFileInfo.isGif() && fileSize <= HiSettingsHelper.getInstance().getMaxUploadFileSize())
-            return true;
-
-        //very long or wide image
-        if (w > 0 && h > 0 && fileSize <= HiSettingsHelper.getInstance().getMaxUploadFileSize()) {
-            if (Math.max(w, h) * 1.0 / Math.min(w, h) >= 3)
-                return true;
-        }
-
-        //normal image
-        return fileSize <= mMaxImageFileSize && w * h <= mMaxPixels;
+    private boolean isMimeSupported(String mime) {
+        return !TextUtils.isEmpty(mime)
+                && (mime.contains("jpg")
+                || mime.contains("jpeg")
+                || mime.contains("png")
+                || mime.contains("gif")
+                || mime.contains("bmp"));
     }
 
     private static ByteArrayOutputStream readFileToStream(String file) {
